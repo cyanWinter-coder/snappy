@@ -18,6 +18,11 @@ var (
 	// ErrUnsupported reports that the input isn't supported.
 	ErrUnsupported = errors.New("snappy: unsupported input")
 
+	// ErrLimitExceeded reports that a Reader's total output budget was
+	// exceeded. It is only returned by Readers created with
+	// NewLimitedReader.
+	ErrLimitExceeded = errors.New("snappy: output limit exceeded")
+
 	errUnsupportedLiteralLength = errors.New("snappy: unsupported literal length")
 )
 
@@ -79,10 +84,35 @@ func Decode(dst, src []byte) ([]byte, error) {
 func NewReader(r io.Reader) *Reader {
 	return &Reader{
 		r:       r,
+		limit:   noLimit,
 		decoded: make([]byte, maxBlockSize),
 		buf:     make([]byte, maxEncodedLenOfMaxBlockSize+checksumSize),
 	}
 }
+
+// NewLimitedReader returns a new Reader that decompresses from r, using the
+// framing format described at
+// https://github.com/google/snappy/blob/master/framing_format.txt
+//
+// Unlike a Reader created with NewReader, the total number of uncompressed
+// bytes delivered over the lifetime of a stream is capped at limit. Once the
+// cumulative output exceeds limit, Read and ReadByte return
+// ErrLimitExceeded and the same error is returned by every subsequent call;
+// the Reader does not consume any more of r. A limit of zero means that no
+// output bytes may be delivered, and a negative limit disables the budget.
+//
+// Malformed input is still reported with ErrCorrupt or ErrUnsupported, even
+// when doing so would otherwise exceed the budget: format errors take
+// precedence over the output limit.
+func NewLimitedReader(r io.Reader, limit int64) *Reader {
+	x := NewReader(r)
+	x.limit = limit
+	return x
+}
+
+// noLimit is the sentinel value of Reader.limit for Readers created with
+// NewReader, which do not enforce an output budget.
+const noLimit = -1
 
 // Reader is an io.Reader that can read Snappy-compressed bytes.
 //
@@ -92,20 +122,40 @@ type Reader struct {
 	err     error
 	decoded []byte
 	buf     []byte
+	// limit is the maximum number of uncompressed bytes that may be delivered
+	// over the lifetime of the current stream. A value of noLimit disables the
+	// budget. output is the number of bytes delivered so far.
+	limit  int64
+	output int64
 	// decoded[i:j] contains decoded bytes that have not yet been passed on.
 	i, j       int
 	readHeader bool
 }
 
+var errReaderClosed = errors.New("snappy: Read on a closed Reader")
+
 // Reset discards any buffered data, resets all state, and switches the Snappy
 // reader to read from r. This permits reusing a Reader rather than allocating
 // a new one.
+//
+// The output budget of a limited Reader is restarted at zero, so that the
+// same limit applies to the new stream from its beginning.
 func (r *Reader) Reset(reader io.Reader) {
 	r.r = reader
 	r.err = nil
 	r.i = 0
 	r.j = 0
+	r.output = 0
 	r.readHeader = false
+}
+
+// Close releases the reference to the underlying io.Reader, allowing it to be
+// garbage collected. Subsequent Read or ReadByte calls return an error. It is
+// not necessary to call Close for a Reader to be garbage collected.
+func (r *Reader) Close() error {
+	r.r = nil
+	r.err = errReaderClosed
+	return nil
 }
 
 func (r *Reader) readFull(p []byte, allowEOF bool) (ok bool) {
@@ -239,11 +289,28 @@ func (r *Reader) Read(p []byte) (int, error) {
 		return 0, r.err
 	}
 
+	// fill is a no-op while decoded bytes remain buffered, so an exhausted
+	// budget with buffered data does not touch the underlying reader. When the
+	// buffer is empty it reads at most one more chunk, which is how a stream
+	// ending exactly at the limit reports io.EOF instead of ErrLimitExceeded.
 	if err := r.fill(); err != nil {
 		return 0, err
 	}
 
 	n := copy(p, r.decoded[r.i:r.j])
+	if r.limit != noLimit {
+		// fill only returns a nil error when it has more decoded bytes than
+		// have been passed on, so an exhausted budget here means the stream
+		// has more output than the budget allows.
+		if r.output >= r.limit {
+			r.err = ErrLimitExceeded
+			return 0, r.err
+		}
+		if remaining := r.limit - r.output; int64(n) > remaining {
+			n = int(remaining)
+		}
+		r.output += int64(n)
+	}
 	r.i += n
 	return n, nil
 }
@@ -258,6 +325,13 @@ func (r *Reader) ReadByte() (byte, error) {
 		return 0, err
 	}
 
+	if r.limit != noLimit {
+		if r.output >= r.limit {
+			r.err = ErrLimitExceeded
+			return 0, r.err
+		}
+		r.output++
+	}
 	c := r.decoded[r.i]
 	r.i++
 	return c, nil
